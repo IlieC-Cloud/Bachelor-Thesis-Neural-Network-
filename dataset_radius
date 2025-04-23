@@ -1,0 +1,66 @@
+import os
+import torch
+import numpy as np
+from torch.utils.data import Dataset
+
+class SimulationRadiusDataset(Dataset):
+
+  #  PyTorch Dataset for loading preprocessed GISAXS simulation data for training a neural network to predict radius distributions.
+    
+    def __init__(self, data_dir, num_bins=370, radius_range=(2, 8), debug=False):
+        
+      
+          # data_dir: Directory containing .pt and .npy parameter files
+          # num_bins: Number of bins for output soft label
+          # radius_range: Min and max radius range for soft label
+
+
+        self.data_dir = data_dir
+        self.num_bins = num_bins
+        self.radius_range = radius_range
+        self.bin_edges = np.linspace(radius_range[0], radius_range[1], num_bins + 1)
+        self.file_ids = sorted([f.replace(".pt", "") for f in os.listdir(data_dir) if f.endswith(".pt")])
+        self.debug = debug
+
+    def __len__(self):
+        return len(self.file_ids)
+
+    def __getitem__(self, idx):
+        sample_id = self.file_ids[idx]
+
+        # Load and flatten image tensor
+        img_path = os.path.join(self.data_dir, f"{sample_id}.pt")
+        image = torch.load(img_path).view(-1)  # Flatten to (N,)
+
+        # Load parameters and extract radius
+        param_path = os.path.join(self.data_dir, f"{sample_id}_params.npy")
+        params = np.load(param_path, allow_pickle=True).item()
+        true_radius = params["radius"]
+
+        # Convert radius to soft distribution
+        radius_distribution = self._value_to_distribution(true_radius)
+        radius_distribution = torch.tensor(radius_distribution, dtype=torch.float32)
+
+        # Debug
+        if self.debug:
+            bin_centers = 0.5 * (self.bin_edges[:-1] + self.bin_edges[1:])
+            print(f"[DEBUG] {sample_id} | Radius = {true_radius:.4f} nm")
+            print(f"[DEBUG] Label sum = {radius_distribution.sum():.4f}, Max = {radius_distribution.max():.4f}, Argmax = {torch.argmax(radius_distribution)}")
+            print(f"[DEBUG] Radius Range: {self.radius_range}, Closest Bin Center = {bin_centers[torch.argmax(radius_distribution)]}\n")
+
+        return image, radius_distribution
+
+    def _value_to_distribution(self, value, sigma=0.5):
+      
+      
+        bin_centers = 0.5 * (self.bin_edges[:-1] + self.bin_edges[1:])
+        dist = np.exp(-0.5 * ((bin_centers - value) / sigma) ** 2)
+
+        sum_dist = dist.sum()
+        if sum_dist == 0 or np.isnan(sum_dist):
+            dist = np.zeros_like(bin_centers)
+            closest_bin = np.argmin(np.abs(bin_centers - value))
+            dist[closest_bin] = 1.0
+        else:
+            dist /= sum_dist
+        return dist
