@@ -1,0 +1,62 @@
+import os
+import torch
+import numpy as np
+from torch.utils.data import Dataset
+
+
+class SimulationDistanceDataset(Dataset):
+  
+    # PyTorch Dataset for loading preprocessed GISAXS simulation data for training a neural network to predict distance distributions.
+    # Each sample consists of:
+    # preprocessed image tensor (.pt)
+    # soft one-hot distribution label over distance bins (.npy)
+  
+
+    def __init__(self, data_dir, num_bins=370, distance_range=(1, 20)):
+      
+        
+    #  data_dir: Path to the directory containing .pt and .npy files
+    #  num_bins: Number of bins for distance distribution
+    #  distance_range: Min and max values of distance
+    
+        self.data_dir = data_dir
+        self.num_bins = num_bins
+        self.bin_edges = np.linspace(distance_range[0], distance_range[1], num_bins + 1)
+        self.file_ids = sorted([f.replace(".pt", "") for f in os.listdir(data_dir) if f.endswith(".pt")])
+
+    def __len__(self):
+        return len(self.file_ids)
+
+    def __getitem__(self, idx):
+        sample_id = self.file_ids[idx]
+
+        # Load image tensor
+        img_path = os.path.join(self.data_dir, f"{sample_id}.pt")
+        image = torch.load(img_path)
+
+        # Load and parse parameter file
+        param_path = os.path.join(self.data_dir, f"{sample_id}_params.npy")
+        params = np.load(param_path, allow_pickle=True).item()
+        true_distance = params["distance"]
+
+        # Convert scalar distance to distribution (Gaussian around bin)
+        distance_distribution = self._distance_to_distribution(true_distance)
+        distance_distribution = torch.tensor(distance_distribution, dtype=torch.float32)
+
+        return image, distance_distribution
+
+    def _distance_to_distribution(self, value, sigma=0.5):
+        bin_centers = 0.5 * (self.bin_edges[:-1] + self.bin_edges[1:])
+        dist = np.exp(-0.5 * ((bin_centers - value) / sigma) ** 2)
+
+        sum_dist = dist.sum()
+        if sum_dist == 0 or np.isnan(sum_dist):
+            # Fall back to a sharp one-hot distribution
+            closest_bin = np.argmin(np.abs(bin_centers - value))
+            dist = np.zeros_like(bin_centers)
+            dist[closest_bin] = 1.0
+        else:
+            dist /= sum_dist  # normalize to 1
+
+        return dist
+
