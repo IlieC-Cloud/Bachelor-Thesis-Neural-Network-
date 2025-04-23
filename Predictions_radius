@@ -1,0 +1,92 @@
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+from radius_model import RadiusMLP
+from tqdm import tqdm
+
+
+model_path = "checkpoints_radius/best_radius_model_20250417_013323.pth"
+input_dir = Path("D:/HEATEDpreprocessed")
+# input_dir = Path("D:/asdeposited_preprocessed")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+num_bins = 370
+radius_range = (2, 8)
+
+
+model = RadiusMLP(num_bins=num_bins).to(device)
+checkpoint = torch.load(model_path, map_location=device)
+model.load_state_dict(checkpoint["model_state_dict"])
+model.eval()
+mean_radius = []
+file_names = []
+
+
+
+bin_edges = np.linspace(radius_range[0], radius_range[1], num_bins + 1)
+bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+
+
+
+output_path = Path("D:/heated_radius_BEGINNING")
+# output_path = Path("D:/HEATED_radius_every10th")
+output_path.mkdir(parents=True, exist_ok=True)
+
+max_index = 1300
+pt_files = sorted(input_dir.glob("*.pt"))
+pt_files = [f for f in pt_files if int(f.stem.split("_")[-1]) <= max_index]
+
+
+for pt_file in tqdm(pt_files, desc="Predicting Radius"):
+    tensor = torch.load(pt_file).view(1, -1).to(device)
+
+    with torch.no_grad():
+        log_probs = model(tensor)
+        probs = torch.exp(log_probs).squeeze(0).cpu().numpy()
+
+    predicted_mean = np.sum(probs * bin_centers)
+    predicted_mode = bin_centers[np.argmax(probs)]
+    mean_radius.append(predicted_mean)
+    file_names.append(pt_file.stem)
+
+    print(f" File: {pt_file.name}")
+    print(f" Predicted mean radius: {predicted_mean:.2f} nm")
+    print(f" Peak (mode) radius: {predicted_mode:.2f} nm")
+
+
+    plt.figure(figsize=(10, 3))
+    sns.lineplot(x=bin_centers, y=probs, color='blue', label='Predicted Distribution')
+    plt.axvline(predicted_mean, color='green', linestyle='--', label=f"Mean: {predicted_mean:.2f}")
+    plt.axvline(predicted_mode, color='red', linestyle=':', label=f"Mode: {predicted_mode:.2f}")
+    plt.title(f"Predicted Radius Distribution\n{pt_file.name}")
+    plt.xlabel("Radius (nm)")
+    plt.ylabel("Probability")
+
+    plt.legend()
+    plt.tight_layout()
+
+    plt.savefig(output_path / f"{pt_file.stem}_radius_prediction.pdf", dpi=600, format='pdf')
+    plt.close()
+
+
+
+
+# skip = 14
+# mean_radius_trimmed = mean_radius[skip:]
+# file_names_trimmed = file_names[skip:]
+plt.figure(figsize=(12, 4))
+# x_indices = np.arange(len(mean_radius))[skip:]
+plt.plot(mean_radius, marker='o', linestyle='-', color='purple',markersize=1)
+
+plt.xlabel("Sample")
+plt.ylabel("Mean Radius (nm)")
+plt.grid(True)
+plt.tight_layout()
+
+
+summary_path = output_path / "mean_radius_evolution.pdf"
+plt.savefig(summary_path, dpi=600, format='pdf')
+plt.close()
+
+print(f" Mean Radius evolution saved to: {summary_path}")
