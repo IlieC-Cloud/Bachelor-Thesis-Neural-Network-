@@ -1,0 +1,190 @@
+import os
+import time
+import torch
+from torch.utils.data import DataLoader, random_split
+from torch import nn, optim
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+from datetime import datetime
+from radius_dataset import SimulationRadiusDataset
+from radius_model import RadiusMLP
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+# GPU Monitoring
+def report_gpu_usage(note=""):
+    allocated = torch.cuda.memory_allocated() / 1024**2
+    reserved = torch.cuda.memory_reserved() / 1024**2
+    total = torch.cuda.get_device_properties(0).total_memory / 1024**2
+    free = total - reserved
+    print(f"[GPU] {note} | Allocated: {allocated:.1f} MB | Reserved: {reserved:.1f} MB | Free: {free:.1f} MB / {total:.0f} MB")
+
+
+data_dir = "D:/50000NNinput"
+batch_size = 64
+num_epochs = 10
+learning_rate = 1e-4
+num_bins = 370
+radius_range = (2, 8)
+validation_split = 0.1
+debug_mode = False 
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device: {device}")
+
+# Load Dataset
+full_dataset = SimulationRadiusDataset(
+    data_dir=data_dir,
+    num_bins=num_bins,
+    radius_range=radius_range,
+    debug=debug_mode
+)
+val_size = int(len(full_dataset) * validation_split)
+train_size = len(full_dataset) - val_size
+train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+
+# Model, Loss, Optimizer
+model = RadiusMLP(input_shape=(1, 408, 487), num_bins=num_bins).to(device)
+criterion = nn.KLDivLoss(reduction='batchmean')
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+# Training Loop
+train_losses, val_losses = [], []
+best_combined_loss = float('inf')
+checkpoint_dir = "checkpoints"
+os.makedirs(checkpoint_dir, exist_ok=True)
+
+for epoch in range(num_epochs):
+    model.train()
+    train_loss = 0.0
+    print(f"\n--- Epoch {epoch + 1}/{num_epochs} ---")
+
+    for batch_idx, (images, labels) in enumerate(train_loader):
+        start_time = time.perf_counter()
+
+        images = images.to(device)
+        labels = labels.to(device)
+
+        optimizer.zero_grad()
+        outputs = model(images)
+        log_probs = outputs  # already log-probabilities from LogSoftmax
+        loss = criterion(log_probs, labels)
+        loss.backward()
+        optimizer.step()
+
+        end_time = time.perf_counter()
+        batch_time = end_time - start_time
+        train_loss += loss.item()
+        report_gpu_usage(note=f"Epoch {epoch + 1} | Batch {batch_idx + 1}")
+        print(f"[GPU] Batch {batch_idx + 1} | Time: {batch_time:.4f}s | Loss: {loss.item():.6f}")
+        print(f"Output stats → min: {outputs.min().item():.6f}, max: {outputs.max().item():.6f}")
+
+    avg_train_loss = train_loss / len(train_loader)
+    train_losses.append(avg_train_loss)
+    print(f"✅ Epoch {epoch + 1} complete | Avg Train Loss: {avg_train_loss:.6f}")
+
+    # Validation
+    model.eval()
+    val_loss = 0.0
+    with torch.no_grad():
+        for images, labels in val_loader:
+            images = images.to(device)
+            labels = labels.to(device)
+            outputs = model(images)
+            log_probs = outputs  # already log-probabilities from LogSoftmax
+
+            loss = criterion(log_probs, labels)
+            val_loss += loss.item()
+
+    avg_val_loss = val_loss / len(val_loader)
+    val_losses.append(avg_val_loss)
+    print(f"📉 Validation Loss: {avg_val_loss:.6f}")
+
+    # Save Best Checkpoint
+    combined_loss = avg_train_loss + avg_val_loss
+    if combined_loss < best_combined_loss:
+        best_combined_loss = combined_loss
+        ckpt_path = os.path.join(checkpoint_dir, f"best_radius_model_{timestamp}.pth")
+        torch.save({
+            'epoch': epoch + 1,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'train_loss': avg_train_loss,
+            'val_loss': avg_val_loss
+        }, ckpt_path)
+        print(f"✅ Best model saved: {ckpt_path} (Combined loss: {combined_loss:.4f})")
+
+print("\n✅ Training complete.")
+
+# Learning Curve
+plt.figure(figsize=(10, 6))
+plt.plot(train_losses, label='Training Loss', marker='o')
+plt.plot(val_losses, label='Validation Loss', marker='x')
+plt.xlabel('Epoch')
+plt.ylabel('KL Divergence Loss')
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.savefig(r"C:\Users\Ilies\Desktop\papersGISAXS\radius_loss_curve1.pdf", format='pdf', dpi=600)
+plt.show()
+
+# KL Histogram
+kl_values = []
+model.eval()
+with torch.no_grad():
+    for images, labels in val_loader:
+        images = images.to(device)
+        labels = labels.to(device)
+        outputs = model(images)
+        log_probs = torch.log(torch.clamp(outputs, min=1e-8))
+        kl_sample = torch.sum(labels * (torch.log(torch.clamp(labels, min=1e-8)) - log_probs), dim=1)
+        kl_values.extend(kl_sample.cpu().numpy())
+
+plt.figure(figsize=(8, 5))
+plt.hist(kl_values, bins=30, color='skyblue', edgecolor='black')
+plt.xlabel("KL Divergence per Sample")
+plt.ylabel("Frequency")
+plt.tight_layout()
+plt.savefig(r"C:\Users\Ilies\Desktop\papersGISAXS\radius_kl_histogram1.pdf", format='pdf', dpi=600)
+plt.show()
+
+# Heatmap: True vs Predicted Radius
+sample_image, true_dist = val_dataset[0]
+sample_image = sample_image.unsqueeze(0).to(device)
+
+model.eval()
+with torch.no_grad():
+    log_pred = model(sample_image).squeeze(0).cpu()
+    pred_dist = torch.exp(log_pred).numpy()  # ✅ Convert back from log-space
+
+true_dist_np = true_dist.numpy()
+
+# Debug
+print(f"True dist stats → min: {true_dist_np.min():.6f}, max: {true_dist_np.max():.6f}, sum: {true_dist_np.sum():.4f}")
+print(f"Pred dist stats → min: {pred_dist.min():.6f}, max: {pred_dist.max():.6f}, sum: {pred_dist.sum():.4f}")
+
+# Bins
+bin_edges = np.linspace(radius_range[0], radius_range[1], num_bins + 1)
+bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+
+# X-axis ticks
+xtick_indices = np.linspace(0, num_bins - 1, 6).astype(int)
+xtick_labels = [f"{bin_centers[i]:.1f}" for i in xtick_indices]
+
+# Plot
+plt.figure(figsize=(12, 2))
+sns.heatmap([true_dist_np, pred_dist], cmap='viridis', cbar=True, xticklabels=50)
+plt.xticks(ticks=xtick_indices, labels=xtick_labels)
+plt.yticks([0.5, 1.5], ['True', 'Predicted'])
+plt.xlabel("Radius (nm)")
+plt.tight_layout()
+plt.savefig(r"C:\Users\Ilies\Desktop\papersGISAXS\radius_distribution_heatmap_FIXED.pdf", format='pdf', dpi=600)
+plt.show()
+
+
+
+
