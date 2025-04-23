@@ -1,0 +1,90 @@
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+from model import DistanceCNN 
+
+model_path = "checkpoints/best_model_20250416_011206.pth"
+# input_dir = Path("D:/HEATEDpreprocessed")
+input_dir = Path("D:/asdeposited_preprocessed")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+num_bins = 370
+distance_range = (1, 20) 
+
+# Load trained model
+model = DistanceCNN(num_bins=num_bins).to(device)
+checkpoint = torch.load(model_path, map_location=device)
+model.load_state_dict(checkpoint["model_state_dict"])
+model.eval()
+mean_distances = []
+file_names = []
+
+
+# Calculate bin centers
+bin_edges = np.linspace(distance_range[0], distance_range[1], num_bins + 1)
+bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+
+# Optional Slice
+max_index = 1300
+pt_files = sorted(input_dir.glob("*.pt"))
+pt_files = [f for f in pt_files if int(f.stem.split("_")[-1]) <= max_index]
+
+# Process all experimental images
+for pt_file in pt_files:
+    tensor = torch.load(pt_file).unsqueeze(0).to(device)  # add batch dimension
+    with torch.no_grad():
+        prediction = model(tensor).squeeze(0).cpu().numpy()
+
+    # distance 
+    predicted_mean = np.sum(prediction * bin_centers)
+    predicted_mode = bin_centers[np.argmax(prediction)]
+    mean_distances.append(predicted_mean)
+    file_names.append(pt_file.stem)
+
+    print(f" File: {pt_file.name}")
+    print(f" Predicted mean distance: {predicted_mean:.2f} units")
+    print(f" Peak (mode) distance: {predicted_mode:.2f} units")
+
+    # Plot the predicted distribution
+    plt.figure(figsize=(10, 3))
+    sns.lineplot(x=bin_centers, y=prediction, color='blue', label='Predicted Distribution')
+    plt.axvline(predicted_mean, color='green', linestyle='--', label=f"Mean: {predicted_mean:.2f}")
+    plt.axvline(predicted_mode, color='red', linestyle=':', label=f"Mode: {predicted_mode:.2f}")
+    plt.title(f"Predicted Distance Distribution\n{pt_file.name}")
+    plt.xlabel("Distance (nm)")
+    plt.ylabel("Probability")
+    # Optional x-axis scaling
+    if predicted_mean < 12:
+        plt.xlim(8, 12)
+    elif predicted_mean > 15:
+        plt.xlim(10, 20)
+    else:
+        plt.xlim(5, 20)
+    
+    plt.legend()
+    plt.tight_layout()
+
+    # Save plot 
+    output_path = Path("D:/asdeposited_distance_BEGINNING")
+    output_path.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output_path / f"{pt_file.stem}_prediction.pdf", dpi=600, format='pdf')
+    plt.close()
+
+# Plot Mean Distance evolution
+plt.figure(figsize=(12, 4))
+plt.plot(mean_distances, marker='o', linestyle='-', color='purple',markersize=1)
+
+plt.xlabel("Sample")
+plt.ylabel("Mean Distance (nm)")
+plt.grid(True)
+plt.tight_layout()
+
+# Save plot
+summary_path = output_path / "mean_distance_evolution.pdf"
+plt.savefig(summary_path, dpi=600, format='pdf')
+plt.close()
+
+print(f"Mean distance evolution saved to: {summary_path}")
+
+
