@@ -1,0 +1,180 @@
+import bornagain as ba
+from bornagain import angstrom, nanometer, deg, R3, ba_plot as bp
+import numpy as np
+import os
+import h5py
+from PIL import Image
+import logging
+import datetime
+import matplotlib.pyplot as plt
+from scipy.ndimage import label, find_objects
+
+# Logging einrichten
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# Allgemeine Parameter
+WAVELENGTH = 1.05 * angstrom  # Röntgenwellenlänge
+INCIDENT_ANGLE = 0.495 * deg  # Einfallswinkel
+NUMBER_SIMULATIONS = 50000
+
+# Maske aus Datei laden
+#MASK_FILE = r"D:\BornAgain_simData\optimized_simulation\pilatus_300k_mask.tif"
+MASK_FILE = r"C:\Users\Ilies\LRZ Sync+Share\Ilie\DPDAK_V1_5_9\mask_files\pilatus_300k_mask.tif"
+if os.path.exists(MASK_FILE):
+    mask_image = Image.open(MASK_FILE).convert("L")  # Lade Maske als Graustufenbild
+    mask_array = np.array(mask_image) > 0  # Binärmaske erstellen
+else:
+    mask_array = None
+
+# Funktion zur Extraktion größerer Maskenregionen
+def extract_mask_regions(mask_array):
+    """
+    Find connected masked regions and convert them into bounding rectangles.
+    """
+    if mask_array is None:
+        return []
+
+    labeled_array, num_features = label(mask_array)
+    mask_rectangles = []
+    for slice_obj in find_objects(labeled_array):
+        if slice_obj is not None:
+            y_start, y_stop = slice_obj[0].start, slice_obj[0].stop
+            x_start, x_stop = slice_obj[1].start, slice_obj[1].stop
+            mask_rectangles.append((x_start * 0.172, y_start * 0.172, x_stop * 0.172, y_stop * 0.172))
+
+    return mask_rectangles
+
+# Vorverarbeitete Maskenregionen nur einmal extrahieren
+mask_rectangles = extract_mask_regions(mask_array)
+
+# Einmalige RNG-Instanz erstellen
+rng = np.random.default_rng(seed=42)
+
+def generate_valid_distances(radius):
+    """
+    Generiert eine gültige Partikeldistanz basierend auf dem Radius.
+    """
+    min_distance = 2 * radius  # Mindestdistanz ist der doppelte Radius
+    max_distance = min_distance * 3  # Maximale Distanz als Faktor
+    return rng.uniform(min_distance, max_distance)
+
+# Optimierte Funktion zur Erstellung einer Probe mit Nanopartikeln
+def get_sample(params):
+    material_particle = ba.MaterialBySLD("Gold", 112.563e-06, 6.907e-06)
+    material_substrate = ba.MaterialBySLD("Protein", 12.1e-6, 0.5e-6)
+    vacuum = ba.RefractiveMaterial("Vacuum", 0, 0)
+
+    layer_vacuum = ba.Layer(vacuum)
+    layer_substrate = ba.Layer(material_substrate)
+
+    for i in range(1, 4):
+        if params[f"mean_radius_FF{i}"] > 0:
+            layout = ba.ParticleLayout()
+            layout.setTotalParticleSurfaceDensity(params[f"surface_density_FF{i}"])
+
+            # Größenverteilung der Radien
+            distr_radius = ba.DistributionGaussian(
+                params[f"mean_radius_FF{i}"] * nanometer,
+                params[f"radius_sigma_FF{i}"] * params[f"mean_radius_FF{i}"] * nanometer,
+            )
+
+            for sample_radius in distr_radius.distributionSamples():
+                particle = ba.Particle(material_particle, ba.Sphere(sample_radius.value))
+                layout.addParticle(particle, sample_radius.weight)
+
+            if params[f"mean_distance_FF{i}"] > 0:
+                interference = ba.InterferenceRadialParacrystal(params[f"mean_distance_FF{i}"] * nanometer, params[f"distance_probability_FF{i}"] * nanometer)
+                interference.setProbabilityDistribution(ba.Profile1DGauss(params[f"mean_distance_FF{i}"] * params[f"distance_sigma_FF{i}"] * nanometer))
+                layout.setInterference(interference)
+
+            layer_vacuum.addLayout(layout)
+
+    roughness = ba.LayerRoughness(5 * nanometer, 0.5, 1000 * nanometer)
+    sample = ba.MultiLayer()
+    sample.addLayer(layer_vacuum)
+    sample.addLayerWithTopRoughness(layer_substrate, roughness)
+    sample.setCrossCorrLength(0 * nanometer)
+
+    return sample
+
+def get_simulation(sample):
+    beam = ba.Beam(1e8, WAVELENGTH, INCIDENT_ANGLE)
+    detector = ba.RectangularDetector(487, 83.8, 619, 106.5)
+    detector.setPerpendicularToDirectBeam(2633, 473 * 0.172, 82 * 0.172)
+    detector.setResolutionFunction(ba.ResolutionFunction2DGaussian(0.02, 0.02))
+
+    simulation = ba.ScatteringSimulation(beam, sample, detector)
+    simulation.options().setIncludeSpecular(True)
+    simulation.setBackground(ba.PoissonBackground())
+    add_mask_to_simulation(simulation, mask_rectangles)
+    simulation.detector().setRegionOfInterest(0*0.172, 212*0.172, 487*0.172, 619*0.172)
+    return simulation
+
+def add_mask_to_simulation(simulation, mask_rectangles):
+    for x_start, y_start, x_stop, y_stop in mask_rectangles:
+        simulation.detector().addMask(ba.Rectangle(x_start, y_start, x_stop, y_stop), True)
+
+# Funktion zur Speicherung der Simulationsdaten
+def save_simulation_data(file, index, params, output):
+    group_name = f"iteration_{str(index).zfill(5)}"
+    group = file.create_group(group_name)
+    for key, value in params.items():
+        group.create_dataset(key, data=value)
+    group.create_dataset('output', data=output)
+
+# Listen zur Speicherung der Werte
+simulated_radii = []
+simulated_distances = []
+
+if __name__ == '__main__':
+    #save_dir = "D:/BornAgain_simData/optimized_simulation"
+    save_dir = "D:\RS0.25-DS0.25"
+
+    os.makedirs(save_dir, exist_ok=True)
+    img_name = "2502062_"
+
+    params = {
+        "surface_density_FF1": 1, "mean_radius_FF1": 8, "radius_sigma_FF1": 0.25,
+        "surface_density_FF2": 0, "mean_radius_FF2": 0, "radius_sigma_FF2": 0.0,
+        "surface_density_FF3": 0, "mean_radius_FF3": 0, "radius_sigma_FF3": 0.0,
+        "mean_distance_FF1": 1, "distance_sigma_FF1": 0.25, "distance_probability_FF1": 30,
+        "mean_distance_FF2": 0, "distance_sigma_FF2": 0.4, "distance_probability_FF2": 30,
+        "mean_distance_FF3": 0, "distance_sigma_FF3": 0.4, "distance_probability_FF3": 80,
+    }
+
+    for counter in range(1, NUMBER_SIMULATIONS + 1):
+        with h5py.File(os.path.join(save_dir, "simulation_data_" + img_name + f"{counter:05d}.h5"), 'w') as f:
+            radius = rng.uniform(2, 8)
+            distance = generate_valid_distances(radius)
+            simulated_radii.append(radius)
+            simulated_distances.append(distance)
+            params["mean_radius_FF1"] = radius
+            params["mean_distance_FF1"] = distance
+
+            sample = get_sample(params)
+            simulation = get_simulation(sample)
+
+            if simulation is None:
+                logging.error("Fehler: Simulation konnte nicht erstellt werden!")
+                continue
+
+            result = simulation.simulate()
+            output = result.array().astype('float')
+
+            # bp.parse_args(units=ba.Coords_QSPACE)
+            # bp.plot_simulation_result(result)
+
+            output = result.array().astype('float')
+            save_simulation_data(f, counter, params, output)
+            Image.fromarray(output).save(os.path.join(save_dir, "simulation_data_" + img_name + f"{counter:05d}.tif"))
+            logging.info(f"Simulation {counter} abgeschlossen: {datetime.datetime.now().time()}")
+
+
+    # Diagramm der simulierten Werte anzeigen
+    plt.scatter(simulated_radii, simulated_distances, alpha=0.7)
+    plt.xlabel("Radius (nm)")
+    plt.ylabel("Distanz (nm)")
+    plt.title("Simulierte Radien vs. Distanzen")
+    plt.grid(True)
+    plt.show()
+    logging.info("Alle Simulationen abgeschlossen und gespeichert.")
