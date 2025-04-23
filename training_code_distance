@@ -1,0 +1,188 @@
+
+import os
+import time
+import torch
+from torch.utils.data import DataLoader, random_split
+from torch import nn, optim
+import seaborn as sns
+import numpy as np
+from dataset import SimulationDistanceDataset
+from model import DistanceCNN
+import matplotlib.pyplot as plt
+from datetime import datetime
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+def report_gpu_usage(note=""):
+    allocated = torch.cuda.memory_allocated() / 1024**2
+    reserved = torch.cuda.memory_reserved() / 1024**2
+    total = torch.cuda.get_device_properties(0).total_memory / 1024**2
+    free = total - reserved
+    print(f"[GPU] {note} | Allocated: {allocated:.1f} MB | Reserved: {reserved:.1f} MB | Free: {free:.1f} MB / {total:.0f} MB")
+
+train_losses = []
+val_losses = []
+
+# Configurations
+data_dir = "D:/50000NNinput"
+batch_size = 32
+num_epochs = 10
+learning_rate = 1e-4
+num_bins = 370
+validation_split = 0.1
+
+# Device Setup
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# Dataset and DataLoader
+full_dataset = SimulationDistanceDataset(data_dir=data_dir, num_bins=num_bins)
+val_size = int(len(full_dataset) * validation_split)
+train_size = len(full_dataset) - val_size
+train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+
+# Model, Loss, Optimizer
+model = DistanceCNN(num_bins=num_bins).to(device)
+criterion = nn.KLDivLoss(reduction='batchmean')
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+# Best Checkpoint Tracker
+best_combined_loss = float('inf')
+checkpoint_dir = "checkpoints"
+os.makedirs(checkpoint_dir, exist_ok=True)
+
+# Training Loop
+for epoch in range(num_epochs):
+    model.train()
+    train_loss = 0.0
+    print(f"\n--- Epoch {epoch + 1}/{num_epochs} ---")
+
+    for batch_idx, (images, labels) in enumerate(train_loader):
+        start_time = time.perf_counter()
+
+        images = images.to(device)
+        labels = labels.to(device)
+
+        optimizer.zero_grad()
+        outputs = model(images)
+
+        log_probs = torch.log(torch.clamp(outputs, min=1e-8))
+        loss = criterion(log_probs, labels)
+
+        loss.backward()
+        optimizer.step()
+
+        end_time = time.perf_counter()
+        batch_time = end_time - start_time
+        train_loss += loss.item()
+        report_gpu_usage(note=f"Epoch {epoch + 1} | Batch {batch_idx + 1}")
+
+        print(
+            f"[GPU] Batch {batch_idx + 1} | Time: {batch_time:.4f}s | "
+            f"Loss: {loss.item():.6f}"
+        )
+
+    avg_train_loss = train_loss / len(train_loader)
+    print(f"Epoch {epoch + 1} complete | Avg Train Loss: {avg_train_loss:.6f}")
+    train_losses.append(avg_train_loss)
+
+    # Validation Phase
+    model.eval()
+    val_loss = 0.0
+    with torch.no_grad():
+        for images, labels in val_loader:
+            images = images.to(device)
+            labels = labels.to(device)
+
+            outputs = model(images)
+            log_probs = torch.log(torch.clamp(outputs, min=1e-8))
+            loss = criterion(log_probs, labels)
+            val_loss += loss.item()
+
+    avg_val_loss = val_loss / len(val_loader)
+    print(f"Validation Loss: {avg_val_loss:.6f}")
+    val_losses.append(avg_val_loss)
+
+    # Save Best Model Only
+    combined_loss = avg_train_loss + avg_val_loss
+
+    if combined_loss < best_combined_loss:
+        best_combined_loss = combined_loss
+        best_model_path = os.path.join(checkpoint_dir, f"best_model_{timestamp}.pth")
+        torch.save({
+            'epoch': epoch + 1,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'train_loss': avg_train_loss,
+            'val_loss': avg_val_loss
+        }, best_model_path)
+        print("Best model saved (lowest combined loss: {combined_loss:.6f})")
+
+print("Training complete.")
+
+# Plot Learning Curve
+plt.figure(figsize=(10, 6))
+plt.plot(train_losses, label='Training Loss', marker='o')
+plt.plot(val_losses, label='Validation Loss', marker='x')
+plt.xlabel('Epoch')
+plt.ylabel('KL Divergence Loss')
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.savefig(r"C:\Users\Ilies\Desktop\papersGISAXS\loss_curve3.pdf", format='pdf', dpi=600)
+plt.show()
+# KL Divergence Histogram
+kl_values = []
+model.eval()
+with torch.no_grad():
+    for images, labels in val_loader:
+        images = images.to(device)
+        labels = labels.to(device)
+        outputs = model(images)
+        log_probs = torch.log(torch.clamp(outputs, min=1e-8))
+        kl_per_sample = torch.sum(labels * (torch.log(torch.clamp(labels, min=1e-8)) - log_probs), dim=1)
+        kl_values.extend(kl_per_sample.cpu().numpy())
+
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(8, 5))
+plt.hist(kl_values, bins=30, color='skyblue', edgecolor='black')
+plt.xlabel("KL Divergence per Sample")
+plt.ylabel("Frequency")
+plt.tight_layout()
+plt.savefig(r"C:\Users\Ilies\Desktop\papersGISAXS\kl_histogram3.pdf", format='pdf', dpi=600)
+plt.show()
+
+# One sample from validation set
+sample_image, true_dist = val_dataset[0]
+sample_image = sample_image.unsqueeze(0).to(device)
+
+model.eval()
+with torch.no_grad():
+    pred_dist = model(sample_image).squeeze(0).cpu().numpy()
+
+true_dist_np = true_dist.numpy()
+
+
+# distance range and bins
+distance_range = (1, 6)
+bin_edges = np.linspace(distance_range[0], distance_range[1], num_bins + 1)
+bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+plt.figure(figsize=(12, 2))
+sns.heatmap([true_dist_np, pred_dist], cmap='viridis', cbar=True, xticklabels=50)
+
+# tick positions and labels
+xticks = np.linspace(0, num_bins, 6)
+xlabels = [f"{v:.1f}" for v in np.linspace(distance_range[0], distance_range[1], 6)]
+
+plt.xticks(ticks=xticks, labels=xlabels)
+
+plt.yticks([0.5, 1.5], ['True', 'Predicted'])
+plt.xlabel("Distance Bin")
+plt.tight_layout()
+plt.savefig(r"C:\Users\Ilies\Desktop\papersGISAXS\distribution_heatmap3.pdf", format='pdf', dpi=600)
+plt.show()
+
+
