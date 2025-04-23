@@ -1,0 +1,22 @@
+import torch.nn as nn
+
+
+class RadiusMLP(nn.Module):
+    def __init__(self, input_shape=(1, 408, 487), num_bins=370):
+        super(RadiusMLP, self).__init__()
+
+        self.input_size = input_shape[0] * input_shape[1] * input_shape[2]
+
+        self.model = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(self.input_size, 1024),
+            nn.LeakyReLU(negative_slope=0.03),
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Linear(512, num_bins),
+            nn.LogSoftmax(dim=1)  
+        )
+
+    def forward(self, x):
+        return self.model(x)  # Output is already log-probabilities
+
