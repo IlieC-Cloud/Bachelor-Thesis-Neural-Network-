@@ -1,0 +1,62 @@
+import torch
+import numpy as np
+from PIL import Image
+import fabio
+from tqdm import tqdm
+from pathlib import Path
+import torchvision.transforms as transforms
+
+
+def preprocess_experimental_cbf(cbf_path, mask_path, target_shape=(408, 487)):
+
+    cbf_image = fabio.open(cbf_path).data.astype(np.float32)
+
+
+    cbf_image = np.nan_to_num(cbf_image, nan=0.0, posinf=0.0, neginf=0.0)
+    cbf_image[cbf_image < 0] = 0.0
+
+
+    log_image = np.log1p(cbf_image)
+
+    mask_image = Image.open(mask_path)
+    mask_array = np.array(mask_image)
+    binary_mask = mask_array > 0
+    log_image[binary_mask] = 0.0
+
+    def center_crop(image, target_shape):
+        h, w = image.shape
+        th, tw = target_shape
+        top = (h - th) // 2
+        left = (w - tw) // 2
+        return image[top:top+th, left:left+tw]
+
+    cropped_image = center_crop(log_image, target_shape)
+
+    transform = transforms.Compose([
+        transforms.Lambda(lambda x: torch.tensor(x, dtype=torch.float32)),
+        transforms.Lambda(lambda x: x.unsqueeze(0)),  
+        transforms.Normalize(mean=[0.5], std=[0.5])])
+
+    image_tensor = transform(cropped_image)
+    return image_tensor
+
+cbf_base_path = Path("D:/experimentalData/sputter/heated/p300k3")
+mask_path = "D:/pilatus_300k_mask.tif"
+output_dir = Path("D:/HEATEDpreprocessed")
+output_dir.mkdir(parents=True, exist_ok=True)
+
+
+for i in tqdm(range(30, 20001, 10), desc="Preprocessing Experimental CBFs"):
+    file_num = f"{i:05d}"
+    filename = f"au_jh_blg_heated_13_00002_{file_num}.cbf"
+    cbf_path = cbf_base_path / filename
+
+    if cbf_path.exists():
+        try:
+            tensor = preprocess_experimental_cbf(str(cbf_path), mask_path)
+            save_path = output_dir / f"exp_{file_num}.pt"
+            torch.save(tensor, save_path)
+        except Exception as e:
+            print(f" Error processing {filename}: {e}")
+    else:
+        print(f" File not found: {cbf_path}")
