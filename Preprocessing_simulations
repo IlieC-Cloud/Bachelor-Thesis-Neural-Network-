@@ -1,0 +1,50 @@
+import h5py
+import numpy as np
+import os
+import torch
+import torchvision.transforms as transforms
+from tqdm import tqdm
+
+# Define paths
+input_h5_file = "D:/test4/simulation_data_250313_.h5" 
+output_dir = "D:/50000NNinput"  
+os.makedirs(output_dir, exist_ok=True)
+
+#  transformation 
+image_transform = transforms.Compose([
+    transforms.Lambda(lambda x: torch.clamp(x, min=0.0)),         
+    transforms.Lambda(lambda x: torch.log1p(x)),                 
+    transforms.Normalize(mean=[0.5], std=[0.5])                   
+])
+
+def preprocess_and_store(h5_file, output_dir, num_samples=50000):
+   
+   
+    with h5py.File(h5_file, 'r') as f:
+        iterations = sorted([key for key in f.keys() if key.startswith("iteration_")])[:num_samples]
+
+        for i, iter_key in enumerate(tqdm(iterations, desc="Processing Images")):
+            img_data = f[f"{iter_key}/structure"][:]
+
+            # Right format 
+            img_data = np.expand_dims(img_data, axis=0)
+            img_tensor = torch.tensor(img_data, dtype=torch.float32)
+
+            # Apply preprocessing
+            img_tensor = image_transform(img_tensor)
+
+            # Save processed image
+            torch.save(img_tensor, os.path.join(output_dir, f"{iter_key}.pt"))
+
+            # Store parameters
+            params = {
+                "radius": round(f[f"{iter_key}/parameters/radius"][()], 4),
+                "distance": round(f[f"{iter_key}/parameters/distance"][()], 4),
+                "radius_sigma": round(f[f"{iter_key}/parameters/sigma_radius"][()], 4),
+                "distance_sigma": round(f[f"{iter_key}/parameters/omega_distance"][()], 4)
+            }
+            np.save(os.path.join(output_dir, f"{iter_key}_params.npy"), params)
+
+# Run preprocessing
+preprocess_and_store(input_h5_file, output_dir, num_samples=50000)
+print("Preprocessing completed")
